@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Pytest
+.pytest_cache/
+
+# SQLite database
+coordinator.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Runtime worker storage
+data/*
+!data/.gitkeep
+
+# Test/generated files
+test_files/
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
