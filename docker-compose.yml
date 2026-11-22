@@ -1,0 +1,108 @@
+services:
+
+  controller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: controller
+    command: >
+      uvicorn coordinator.main:app
+      --host 0.0.0.0
+      --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./coordinator.db:/app/coordinator.db
+    restart: unless-stopped
+
+  worker1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: worker1
+    command: >
+      uvicorn storage_node.main:app
+      --host 0.0.0.0
+      --port 8001
+    environment:
+      NODE_ID: worker1
+      NODE_PORT: "8001"
+      STORAGE_DIR: /app/data/node1
+      CONTROLLER_URL: http://controller:8000
+      WORKER_URL: http://worker1:8001
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./data/node1:/app/data/node1
+    depends_on:
+      - controller
+    restart: unless-stopped
+
+  worker2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: worker2
+    command: >
+      uvicorn storage_node.main:app
+      --host 0.0.0.0
+      --port 8002
+    environment:
+      NODE_ID: worker2
+      NODE_PORT: "8002"
+      STORAGE_DIR: /app/data/node2
+      CONTROLLER_URL: http://controller:8000
+      WORKER_URL: http://worker2:8002
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./data/node2:/app/data/node2
+    depends_on:
+      - controller
+    restart: unless-stopped
+
+  worker3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: worker3
+    command: >
+      uvicorn storage_node.main:app
+      --host 0.0.0.0
+      --port 8003
+    environment:
+      NODE_ID: worker3
+      NODE_PORT: "8003"
+      STORAGE_DIR: /app/data/node3
+      CONTROLLER_URL: http://controller:8000
+      WORKER_URL: http://worker3:8003
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./data/node3:/app/data/node3
+    depends_on:
+      - controller
+    restart: unless-stopped
+
+  worker4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: worker4
+    command: >
+      uvicorn storage_node.main:app
+      --host 0.0.0.0
+      --port 8004
+    environment:
+      NODE_ID: worker4
+      NODE_PORT: "8004"
+      STORAGE_DIR: /app/data/node4
+      CONTROLLER_URL: http://controller:8000
+      WORKER_URL: http://worker4:8004
+    ports:
+      - "8004:8004"
+    volumes:
+      - ./data/node4:/app/data/node4
+    depends_on:
+      - controller
+    restart: unless-stopped

@@ -3,9 +3,8 @@ import asyncio
 import hashlib
 import httpx
 
-from fastapi import Request
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 
 from storage_node.storage import (
@@ -16,12 +15,7 @@ from storage_node.storage import (
 )
 
 
-# ==========================================
-# WORKER CONFIGURATION
-# ==========================================
-
 NODE_ID = os.getenv("NODE_ID", "node1")
-
 NODE_PORT = os.getenv("NODE_PORT", "8001")
 
 WORKER_URL = os.getenv(
@@ -35,14 +29,10 @@ CONTROLLER_URL = os.getenv(
 )
 
 HEARTBEAT_INTERVAL = 10
+CONTROLLER_TIMEOUT = 5.0
 
 
-# ==========================================
-# WORKER REGISTRATION
-# ==========================================
-
-async def register_worker(client: httpx.AsyncClient):
-
+async def register_worker(client):
     response = await client.post(
         f"{CONTROLLER_URL}/internal/workers/register",
         json={
@@ -53,56 +43,98 @@ async def register_worker(client: httpx.AsyncClient):
 
     response.raise_for_status()
 
-    print(f"[{NODE_ID}] Registered with controller")
+    print(
+        f"[{NODE_ID}] Registered with controller "
+        f"using {WORKER_URL}"
+    )
 
-
-# ==========================================
-# PERIODIC HEARTBEAT
-# ==========================================
 
 async def heartbeat_loop():
 
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(
+        timeout=CONTROLLER_TIMEOUT
+    ) as client:
 
+        # Initial registration.
+        # If the controller is unavailable, keep retrying,
+        # but do not start a registration/reconciliation storm.
+        registered = False
+
+        while not registered:
+
+            try:
+                await register_worker(client)
+                registered = True
+
+            except httpx.HTTPError as error:
+
+                print(
+                    f"[{NODE_ID}] Controller unavailable during "
+                    f"startup registration: {error}"
+                )
+
+                await asyncio.sleep(5)
+
+        # Normal heartbeat loop.
         while True:
 
             try:
-                try:
-                    response = await client.post(
-                        f"{CONTROLLER_URL}/internal/workers/heartbeat",
-                        json={
-                            "worker_id": NODE_ID
-                        }
-                    )
 
-                    if response.status_code == 404:
-                        await register_worker(client)
-                    else:
-                        response.raise_for_status()
-                        print(f"[{NODE_ID}] Heartbeat sent")
+                response = await client.post(
+                    f"{CONTROLLER_URL}/internal/workers/heartbeat",
+                    json={
+                        "worker_id": NODE_ID
+                    }
+                )
 
-                except httpx.HTTPError:
+                if response.status_code == 404:
+
                     print(
-                        f"[{NODE_ID}] Controller unavailable. "
-                        "Attempting registration..."
+                        f"[{NODE_ID}] Worker is not registered. "
+                        f"Attempting registration..."
                     )
 
-                    await register_worker(client)
+                    try:
+                        await register_worker(client)
+
+                    except httpx.HTTPError as error:
+
+                        print(
+                            f"[{NODE_ID}] Registration failed: {error}"
+                        )
+
+                else:
+
+                    response.raise_for_status()
+
+                    print(
+                        f"[{NODE_ID}] Heartbeat sent"
+                    )
+
+            except httpx.HTTPError as error:
+
+                # IMPORTANT:
+                # A network timeout or controller outage is NOT
+                # treated as a registration event.
+                print(
+                    f"[{NODE_ID}] Controller unavailable: {error}"
+                )
 
             except Exception as error:
-                print(f"[{NODE_ID}] Heartbeat error: {error}")
+
+                print(
+                    f"[{NODE_ID}] Heartbeat error: {error}"
+                )
 
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
-# ==========================================
-# APPLICATION LIFECYCLE
-# ==========================================
-
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app):
 
-    heartbeat_task = asyncio.create_task(heartbeat_loop())
+    heartbeat_task = asyncio.create_task(
+        heartbeat_loop()
+    )
 
     yield
 
@@ -110,6 +142,7 @@ async def lifespan(app: FastAPI):
 
     try:
         await heartbeat_task
+
     except asyncio.CancelledError:
         pass
 
@@ -122,10 +155,6 @@ app = FastAPI(
 )
 
 
-# ==========================================
-# HEALTH CHECK
-# ==========================================
-
 @app.get("/health")
 def health_check():
 
@@ -135,16 +164,15 @@ def health_check():
         "node_id": NODE_ID
     }
 
-# ==========================================
-# INTERNAL CHUNK STORAGE APIs
-# ==========================================
 
 @app.put("/internal/chunks/{chunk_id}")
 async def store_chunk(
-    chunk_id: str,
+    chunk_id,
     request: Request
 ):
+
     try:
+
         content = await request.body()
 
         if not content:
@@ -153,9 +181,14 @@ async def store_chunk(
                 detail="Chunk cannot be empty"
             )
 
-        save_file(chunk_id, content)
+        save_file(
+            chunk_id,
+            content
+        )
 
-        checksum = hashlib.sha256(content).hexdigest()
+        checksum = hashlib.sha256(
+            content
+        ).hexdigest()
 
         return {
             "message": "Chunk stored successfully",
@@ -166,6 +199,7 @@ async def store_chunk(
         }
 
     except ValueError as error:
+
         raise HTTPException(
             status_code=400,
             detail=str(error)
@@ -173,12 +207,14 @@ async def store_chunk(
 
 
 @app.get("/internal/chunks/{chunk_id}")
-def retrieve_chunk(chunk_id: str):
+def retrieve_chunk(chunk_id):
 
     try:
+
         content = get_file(chunk_id)
 
         if content is None:
+
             raise HTTPException(
                 status_code=404,
                 detail="Chunk not found"
@@ -190,6 +226,7 @@ def retrieve_chunk(chunk_id: str):
         )
 
     except ValueError as error:
+
         raise HTTPException(
             status_code=400,
             detail=str(error)
@@ -197,20 +234,25 @@ def retrieve_chunk(chunk_id: str):
 
 
 @app.delete("/internal/chunks/{chunk_id}")
-def remove_chunk(chunk_id: str):
+def remove_chunk(chunk_id):
 
     try:
+
         deleted = delete_file(chunk_id)
 
         if not deleted:
+
             raise HTTPException(
                 status_code=404,
                 detail="Chunk not found"
             )
 
-        return Response(status_code=204)
+        return Response(
+            status_code=204
+        )
 
     except ValueError as error:
+
         raise HTTPException(
             status_code=400,
             detail=str(error)
@@ -218,15 +260,26 @@ def remove_chunk(chunk_id: str):
 
 
 @app.get("/internal/workers/{worker_id}/chunks")
-def get_worker_chunks(worker_id: str):
+def get_worker_chunks(worker_id):
 
     if worker_id != NODE_ID:
+
         raise HTTPException(
             status_code=404,
             detail="Worker not found"
         )
 
-    chunks = list_files()
+    stored_files = list_files()
+
+    # Normalize the storage-layer response to the controller's
+    # chunk API contract.
+    chunks = [
+        {
+            "chunk_id": item["file_id"],
+            "size": item["size"]
+        }
+        for item in stored_files
+    ]
 
     return {
         "worker_id": NODE_ID,
