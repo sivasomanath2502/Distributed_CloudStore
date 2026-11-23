@@ -51,8 +51,14 @@ REPLICATION_FACTOR = 2
 
 HEARTBEAT_TIMEOUT = 30
 HEARTBEAT_CHECK_INTERVAL = 5
+HEARTBEAT_STARTUP_GRACE = 45
 
 HTTP_TIMEOUT = 30.0
+
+# Reconciliation/repair operations modify replica metadata.
+# Serialize them so multiple worker recovery events cannot
+# concurrently modify the same SQLite database state.
+RECONCILIATION_LOCK = asyncio.Lock()
 
 
 # ==========================================
@@ -70,73 +76,86 @@ async def monitor_worker_heartbeats():
     Monitor worker heartbeats and mark workers unhealthy
     when their heartbeat timeout is exceeded.
 
-    Whenever a worker is unhealthy, all ACTIVE replica records
-    belonging to that worker are marked FAILED so that controller
-    metadata accurately reflects worker availability.
+    A startup grace period prevents the controller from
+    incorrectly marking workers unhealthy immediately after
+    the controller itself restarts.
     """
+
+    controller_started_at = datetime.now(timezone.utc)
 
     while True:
 
         db = SessionLocal()
 
         try:
-            workers = db.query(Worker).all()
+            # Give workers enough time to reconnect after a
+            # controller restart before evaluating stale heartbeats.
+            controller_uptime = (
+                datetime.now(timezone.utc) - controller_started_at
+            ).total_seconds()
 
-            current_time = datetime.now(timezone.utc).replace(
-                tzinfo=None
-            )
+            if controller_uptime < HEARTBEAT_STARTUP_GRACE:
+                db.close()
+                await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL)
+                continue
 
-            for worker in workers:
+            async with RECONCILIATION_LOCK:
 
-                if worker.last_heartbeat is None:
-                    continue
+                workers = db.query(Worker).all()
 
-                last_heartbeat = worker.last_heartbeat
+                current_time = datetime.now(timezone.utc).replace(
+                    tzinfo=None
+                )
 
-                # SQLite may return naive datetime objects.
-                if last_heartbeat.tzinfo is not None:
-                    last_heartbeat = last_heartbeat.replace(
-                        tzinfo=None
-                    )
+                for worker in workers:
 
-                elapsed = (
-                    current_time - last_heartbeat
-                ).total_seconds()
+                    if worker.last_heartbeat is None:
+                        continue
 
-                if elapsed > HEARTBEAT_TIMEOUT:
+                    last_heartbeat = worker.last_heartbeat
 
-                    if worker.status != "UNHEALTHY":
-                        print(
-                            f"[Controller] Worker "
-                            f"{worker.worker_id} is UNHEALTHY"
+                    # SQLite may return naive datetime objects.
+                    if last_heartbeat.tzinfo is not None:
+                        last_heartbeat = last_heartbeat.replace(
+                            tzinfo=None
                         )
 
-                    worker.status = "UNHEALTHY"
+                    elapsed = (
+                        current_time - last_heartbeat
+                    ).total_seconds()
 
-                    # IMPORTANT:
-                    # Do this every monitoring cycle while the worker
-                    # remains unhealthy. This also handles the case
-                    # where the controller itself was restarted while
-                    # the worker was already unhealthy.
-                    replicas = db.query(ChunkReplica).filter(
-                        ChunkReplica.worker_id == worker.worker_id,
-                        ChunkReplica.status == "ACTIVE"
-                    ).all()
+                    if elapsed > HEARTBEAT_TIMEOUT:
 
-                    for replica in replicas:
-                        replica.status = "FAILED"
+                        if worker.status != "UNHEALTHY":
+                            print(
+                                f"[Controller] Worker "
+                                f"{worker.worker_id} is UNHEALTHY"
+                            )
 
-                    if replicas:
-                        print(
-                            f"[Controller] Marked "
-                            f"{len(replicas)} replica(s) as FAILED "
-                            f"for unhealthy worker "
-                            f"{worker.worker_id}"
-                        )
+                        worker.status = "UNHEALTHY"
 
-            db.commit()
+                        replicas = db.query(
+                            ChunkReplica
+                        ).filter(
+                            ChunkReplica.worker_id == worker.worker_id,
+                            ChunkReplica.status == "ACTIVE"
+                        ).all()
+
+                        for replica in replicas:
+                            replica.status = "FAILED"
+
+                        if replicas:
+                            print(
+                                f"[Controller] Marked "
+                                f"{len(replicas)} replica(s) as FAILED "
+                                f"for unhealthy worker "
+                                f"{worker.worker_id}"
+                            )
+
+                db.commit()
 
         except Exception as error:
+
             db.rollback()
 
             print(
@@ -144,10 +163,10 @@ async def monitor_worker_heartbeats():
             )
 
         finally:
+
             db.close()
 
         await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL)
-
 
 # ==========================================
 # APPLICATION LIFESPAN
@@ -213,41 +232,47 @@ async def run_worker_reconciliation(db, worker):
     """
     Reconcile a worker's physical storage with controller metadata.
 
-    Registration/heartbeat must remain successful even if
-    reconciliation encounters a temporary error.
+    Reconciliation is serialized because it modifies replica metadata
+    and physical worker state. This prevents simultaneous recovery
+    operations from racing against each other.
     """
 
-    try:
+    async with RECONCILIATION_LOCK:
 
-        print(
-            f"[Controller] Starting reconciliation for "
-            f"{worker.worker_id}"
-        )
+        try:
 
-        result = await reconcile_worker(db, worker)
+            print(
+                f"[Controller] Starting reconciliation for "
+                f"{worker.worker_id}"
+            )
 
-        db.commit()
+            result = await reconcile_worker(
+                db,
+                worker
+            )
 
-        print(
-            f"[Controller] Reconciliation completed for "
-            f"{worker.worker_id}: {result}"
-        )
+            db.commit()
 
-        return result
+            print(
+                f"[Controller] Reconciliation completed for "
+                f"{worker.worker_id}: {result}"
+            )
 
-    except Exception as error:
+            return result
 
-        db.rollback()
+        except Exception as error:
 
-        print(
-            f"[Controller] Reconciliation failed for "
-            f"{worker.worker_id}: {error}"
-        )
+            db.rollback()
 
-        return {
-            "worker_id": worker.worker_id,
-            "errors": [str(error)]
-        }
+            print(
+                f"[Controller] Reconciliation failed for "
+                f"{worker.worker_id}: {error}"
+            )
+
+            return {
+                "worker_id": worker.worker_id,
+                "errors": [str(error)]
+            }
 
 
 # ==========================================

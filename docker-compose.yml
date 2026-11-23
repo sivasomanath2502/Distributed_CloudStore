@@ -9,10 +9,12 @@ services:
       uvicorn coordinator.main:app
       --host 0.0.0.0
       --port 8000
+    environment:
+      DATABASE_URL: sqlite:///./db/coordinator.db
     ports:
       - "8000:8000"
     volumes:
-      - ./coordinator.db:/app/coordinator.db
+      - ./controller_data:/app/db
     restart: unless-stopped
 
   worker1:
