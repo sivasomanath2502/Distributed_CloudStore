@@ -10,11 +10,24 @@ services:
       --host 0.0.0.0
       --port 8000
     environment:
-      DATABASE_URL: sqlite:///./db/coordinator.db
+      # Controller metadata lives in a mounted DIRECTORY. (Mounting a
+      # single not-yet-existing file makes Docker create a directory in
+      # its place and SQLite then cannot open it.)
+      DB_PATH: /app/db/coordinator.db
     ports:
       - "8000:8000"
     volumes:
       - ./controller_data:/app/db
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
     restart: unless-stopped
 
   worker1:
@@ -37,7 +50,8 @@ services:
     volumes:
       - ./data/node1:/app/data/node1
     depends_on:
-      - controller
+      controller:
+        condition: service_healthy
     restart: unless-stopped
 
   worker2:
@@ -60,7 +74,8 @@ services:
     volumes:
       - ./data/node2:/app/data/node2
     depends_on:
-      - controller
+      controller:
+        condition: service_healthy
     restart: unless-stopped
 
   worker3:
@@ -83,7 +98,8 @@ services:
     volumes:
       - ./data/node3:/app/data/node3
     depends_on:
-      - controller
+      controller:
+        condition: service_healthy
     restart: unless-stopped
 
   worker4:
@@ -106,5 +122,22 @@ services:
     volumes:
       - ./data/node4:/app/data/node4
     depends_on:
-      - controller
+      controller:
+        condition: service_healthy
     restart: unless-stopped
+
+  # Optional command-line client (not started by `docker compose up`).
+  #   docker compose run --rm client upload /files/photo.jpg
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["client"]
+    entrypoint: ["python", "-m", "client.cloudstore_cli"]
+    environment:
+      CLOUDSTORE_URL: http://controller:8000
+    volumes:
+      - ./client_files:/files
+    depends_on:
+      controller:
+        condition: service_healthy

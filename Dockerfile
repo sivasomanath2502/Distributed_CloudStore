@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY coordinator ./coordinator
 COPY storage_node ./storage_node
 COPY shared ./shared
+COPY client ./client
 
 RUN mkdir -p /app/data
 

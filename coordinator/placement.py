@@ -4,7 +4,8 @@ import hashlib
 def select_workers(
     chunk_id: str,
     workers: list,
-    replication_factor: int = 2
+    replication_factor: int = 2,
+    load: dict = None
 ):
     """
     Select distinct healthy workers for a chunk.
@@ -13,6 +14,10 @@ def select_workers(
         chunk_id: Unique identifier of the chunk.
         workers: List of Worker database objects.
         replication_factor: Number of worker copies required.
+        load: Optional {worker_id: stored_chunk_count}. When given, the
+            least-loaded healthy workers are preferred (ties are broken
+            by the deterministic hash order), which keeps chunk counts
+            balanced across workers.
 
     Returns:
         List of selected healthy Worker objects.
@@ -53,6 +58,25 @@ def select_workers(
     ).hexdigest()
 
     start_index = int(hash_value, 16) % len(healthy_workers)
+
+    # Load-aware selection: least-loaded workers first, ties broken by
+    # the deterministic circular order starting at start_index.
+    if load is not None:
+
+        count = len(healthy_workers)
+
+        ordered = sorted(
+            range(count),
+            key=lambda i: (
+                load.get(healthy_workers[i].worker_id, 0),
+                (i - start_index) % count
+            )
+        )
+
+        return [
+            healthy_workers[i]
+            for i in ordered[:replication_factor]
+        ]
 
     # Select distinct workers using circular placement.
     selected_workers = []

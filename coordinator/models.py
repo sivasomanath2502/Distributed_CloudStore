@@ -219,3 +219,40 @@ class ChunkReplica(Base):
             "status"
         ),
     )
+
+
+# ==========================================
+# PENDING PHYSICAL DELETES
+# ==========================================
+
+class PendingDelete(Base):
+    """
+    A physical chunk copy that still has to be removed from a worker
+    (for example because the worker was down when the object was deleted).
+    The maintenance loop retries these once the worker is healthy again.
+    """
+    __tablename__ = "pending_deletes"
+
+    id = Column(
+        Integer,
+        primary_key=True
+    )
+
+    worker_id = Column(
+        String,
+        nullable=False,
+        index=True
+    )
+
+    chunk_id = Column(
+        String,
+        nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "worker_id",
+            "chunk_id",
+            name="uq_pending_delete"
+        ),
+    )

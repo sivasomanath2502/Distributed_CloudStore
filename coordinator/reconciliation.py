@@ -10,7 +10,7 @@ REPLICATION_FACTOR = 2
 WORKER_TIMEOUT = 30.0
 
 
-async def reconcile_worker(db, worker):
+async def reconcile_worker(db, worker, purge_unknown: bool = True):
     """
     Reconcile a worker's physical storage with controller metadata.
 
@@ -136,6 +136,11 @@ async def reconcile_worker(db, worker):
             if not chunk:
 
                 result["discovered"] += 1
+
+                # Chunks of an upload that is still in flight are not in
+                # the database yet; the caller disables purging then.
+                if not purge_unknown:
+                    continue
 
                 try:
                     response = await client.delete(

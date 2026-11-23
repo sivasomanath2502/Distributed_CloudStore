@@ -13,7 +13,8 @@ async def store_chunk(
     db,
     object_id: str,
     chunk: dict,
-    workers: list
+    workers: list,
+    load: dict = None
 ):
     """
     Store a chunk on the required number of distinct healthy workers.
@@ -21,8 +22,10 @@ async def store_chunk(
     Initially selected workers are tried first. If a selected worker
     fails, other healthy workers are attempted as replacements.
 
-    Database replica records are created only after the worker confirms
-    that the stored chunk has the expected checksum.
+    A copy counts only after the worker confirms the expected checksum.
+    This function performs NO database writes: the caller records the
+    chunk and replica metadata in one short transaction after every chunk
+    is stored, so no long-lived write lock is held during network I/O.
     """
 
     chunk_id = chunk["chunk_id"]
@@ -48,7 +51,8 @@ async def store_chunk(
     selected_workers = select_workers(
         chunk_id,
         workers,
-        REPLICATION_FACTOR
+        REPLICATION_FACTOR,
+        load
     )
 
     selected_ids = {
@@ -67,25 +71,15 @@ async def store_chunk(
                 and worker.worker_id not in selected_ids
             )
         ],
-        key=lambda worker: worker.worker_id
+        key=lambda worker: (
+            (load or {}).get(worker.worker_id, 0),
+            worker.worker_id
+        )
     )
 
     candidate_workers = (
         selected_workers + fallback_workers
     )
-
-    # Step 4: Create chunk metadata.
-
-    chunk_record = Chunk(
-        chunk_id=chunk_id,
-        object_id=object_id,
-        sequence_number=chunk["sequence_number"],
-        size=chunk["size"],
-        checksum=expected_checksum
-    )
-
-    db.add(chunk_record)
-    db.flush()
 
     successful_replicas = []
 
@@ -138,17 +132,8 @@ async def store_chunk(
 
                     continue
 
-                # Step 6: Record only verified replicas.
-
-                replica = ChunkReplica(
-                    chunk_id=chunk_id,
-                    worker_id=worker.worker_id,
-                    status="ACTIVE",
-                    checksum=expected_checksum
-                )
-
-                db.add(replica)
-                db.flush()
+                # Step 6: Track verified replicas (the caller writes
+                # the database records).
 
                 successful_replicas.append(
                     worker.worker_id

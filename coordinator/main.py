@@ -15,7 +15,11 @@ from fastapi import (
     HTTPException,
     Depends
 )
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+
+from sqlalchemy import func
 
 from sqlalchemy.orm import Session
 
@@ -30,12 +34,13 @@ from coordinator.models import (
     ObjectMetadata,
     Chunk,
     Worker,
-    ChunkReplica
+    ChunkReplica,
+    PendingDelete
 )
 
+from coordinator import maintenance
 from coordinator.chunk_manager import store_chunk
 from coordinator.repair import repair_chunk_replication
-from coordinator.reconciliation import reconcile_worker
 from shared.chunking import (
     split_object,
     calculate_checksum,
@@ -51,14 +56,8 @@ REPLICATION_FACTOR = 2
 
 HEARTBEAT_TIMEOUT = 30
 HEARTBEAT_CHECK_INTERVAL = 5
-HEARTBEAT_STARTUP_GRACE = 45
 
 HTTP_TIMEOUT = 30.0
-
-# Reconciliation/repair operations modify replica metadata.
-# Serialize them so multiple worker recovery events cannot
-# concurrently modify the same SQLite database state.
-RECONCILIATION_LOCK = asyncio.Lock()
 
 
 # ==========================================
@@ -76,86 +75,80 @@ async def monitor_worker_heartbeats():
     Monitor worker heartbeats and mark workers unhealthy
     when their heartbeat timeout is exceeded.
 
-    A startup grace period prevents the controller from
-    incorrectly marking workers unhealthy immediately after
-    the controller itself restarts.
+    Whenever a worker is unhealthy, all ACTIVE replica records
+    belonging to that worker are marked FAILED so that controller
+    metadata accurately reflects worker availability.
     """
 
-    controller_started_at = datetime.now(timezone.utc)
-
     while True:
+
+        # After a controller restart the stored heartbeat timestamps are
+        # stale. Give workers time to heartbeat before judging them,
+        # otherwise every worker and replica is wrongly marked failed.
+        if maintenance.in_startup_grace():
+            await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL)
+            continue
 
         db = SessionLocal()
 
         try:
-            # Give workers enough time to reconnect after a
-            # controller restart before evaluating stale heartbeats.
-            controller_uptime = (
-                datetime.now(timezone.utc) - controller_started_at
-            ).total_seconds()
+            workers = db.query(Worker).all()
 
-            if controller_uptime < HEARTBEAT_STARTUP_GRACE:
-                db.close()
-                await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL)
-                continue
+            current_time = datetime.now(timezone.utc).replace(
+                tzinfo=None
+            )
 
-            async with RECONCILIATION_LOCK:
+            for worker in workers:
 
-                workers = db.query(Worker).all()
+                if worker.last_heartbeat is None:
+                    continue
 
-                current_time = datetime.now(timezone.utc).replace(
-                    tzinfo=None
-                )
+                last_heartbeat = worker.last_heartbeat
 
-                for worker in workers:
+                # SQLite may return naive datetime objects.
+                if last_heartbeat.tzinfo is not None:
+                    last_heartbeat = last_heartbeat.replace(
+                        tzinfo=None
+                    )
 
-                    if worker.last_heartbeat is None:
-                        continue
+                elapsed = (
+                    current_time - last_heartbeat
+                ).total_seconds()
 
-                    last_heartbeat = worker.last_heartbeat
+                if elapsed > HEARTBEAT_TIMEOUT:
 
-                    # SQLite may return naive datetime objects.
-                    if last_heartbeat.tzinfo is not None:
-                        last_heartbeat = last_heartbeat.replace(
-                            tzinfo=None
+                    if worker.status != "UNHEALTHY":
+                        print(
+                            f"[Controller] Worker "
+                            f"{worker.worker_id} is UNHEALTHY"
                         )
 
-                    elapsed = (
-                        current_time - last_heartbeat
-                    ).total_seconds()
+                    worker.status = "UNHEALTHY"
 
-                    if elapsed > HEARTBEAT_TIMEOUT:
+                    # IMPORTANT:
+                    # Do this every monitoring cycle while the worker
+                    # remains unhealthy. This also handles the case
+                    # where the controller itself was restarted while
+                    # the worker was already unhealthy.
+                    replicas = db.query(ChunkReplica).filter(
+                        ChunkReplica.worker_id == worker.worker_id,
+                        ChunkReplica.status == "ACTIVE"
+                    ).all()
 
-                        if worker.status != "UNHEALTHY":
-                            print(
-                                f"[Controller] Worker "
-                                f"{worker.worker_id} is UNHEALTHY"
-                            )
+                    for replica in replicas:
+                        replica.status = "FAILED"
 
-                        worker.status = "UNHEALTHY"
+                    if replicas:
+                        print(
+                            f"[Controller] Marked "
+                            f"{len(replicas)} replica(s) as FAILED "
+                            f"for unhealthy worker "
+                            f"{worker.worker_id}"
+                        )
 
-                        replicas = db.query(
-                            ChunkReplica
-                        ).filter(
-                            ChunkReplica.worker_id == worker.worker_id,
-                            ChunkReplica.status == "ACTIVE"
-                        ).all()
-
-                        for replica in replicas:
-                            replica.status = "FAILED"
-
-                        if replicas:
-                            print(
-                                f"[Controller] Marked "
-                                f"{len(replicas)} replica(s) as FAILED "
-                                f"for unhealthy worker "
-                                f"{worker.worker_id}"
-                            )
-
-                db.commit()
+            db.commit()
 
         except Exception as error:
-
             db.rollback()
 
             print(
@@ -163,10 +156,10 @@ async def monitor_worker_heartbeats():
             )
 
         finally:
-
             db.close()
 
         await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL)
+
 
 # ==========================================
 # APPLICATION LIFESPAN
@@ -175,8 +168,14 @@ async def monitor_worker_heartbeats():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
+    maintenance.mark_started()
+
     monitor_task = asyncio.create_task(
         monitor_worker_heartbeats()
+    )
+
+    maintenance_task = asyncio.create_task(
+        maintenance.maintenance_loop()
     )
 
     print("[Controller] Worker monitoring started")
@@ -186,12 +185,15 @@ async def lifespan(app: FastAPI):
 
     finally:
         monitor_task.cancel()
+        maintenance_task.cancel()
 
-        try:
-            await monitor_task
+        for task in (monitor_task, maintenance_task):
 
-        except asyncio.CancelledError:
-            pass
+            try:
+                await task
+
+            except asyncio.CancelledError:
+                pass
 
         print("[Controller] Worker monitoring stopped")
 
@@ -211,6 +213,30 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request, exc):
+    """
+    The API specification uses 400 (not FastAPI's default 422) for an
+    invalid request.
+    """
+
+    errors = [
+        {
+            "field": ".".join(str(part) for part in error["loc"]),
+            "message": error["msg"]
+        }
+        for error in jsonable_encoder(exc.errors())
+    ]
+
+    return JSONResponse(
+        status_code=400,
+        content={
+            "detail": "Invalid request",
+            "errors": errors
+        }
+    )
+
+
 # ==========================================
 # HEALTH CHECK
 # ==========================================
@@ -222,57 +248,6 @@ def health_check():
         "status": "healthy",
         "service": "coordinator"
     }
-
-
-# ==========================================
-# WORKER RECONCILIATION
-# ==========================================
-
-async def run_worker_reconciliation(db, worker):
-    """
-    Reconcile a worker's physical storage with controller metadata.
-
-    Reconciliation is serialized because it modifies replica metadata
-    and physical worker state. This prevents simultaneous recovery
-    operations from racing against each other.
-    """
-
-    async with RECONCILIATION_LOCK:
-
-        try:
-
-            print(
-                f"[Controller] Starting reconciliation for "
-                f"{worker.worker_id}"
-            )
-
-            result = await reconcile_worker(
-                db,
-                worker
-            )
-
-            db.commit()
-
-            print(
-                f"[Controller] Reconciliation completed for "
-                f"{worker.worker_id}: {result}"
-            )
-
-            return result
-
-        except Exception as error:
-
-            db.rollback()
-
-            print(
-                f"[Controller] Reconciliation failed for "
-                f"{worker.worker_id}: {error}"
-            )
-
-            return {
-                "worker_id": worker.worker_id,
-                "errors": [str(error)]
-            }
 
 
 # ==========================================
@@ -333,11 +308,11 @@ async def register_worker(
         f"[Controller] Worker registered: {worker.worker_id}"
     )
 
-    # Reconcile the worker's storage after registration.
-    reconciliation_result = await run_worker_reconciliation(
-        db,
-        worker
-    )
+    # Reconcile the worker's storage after registration (in the
+    # background, serialized, so requests never block or collide).
+    maintenance.schedule_reconciliation(worker.worker_id)
+
+    reconciliation_result = "scheduled"
 
     return {
         "message": "Worker registered successfully",
@@ -404,10 +379,9 @@ async def worker_heartbeat(
             f"[Controller] Worker recovery detected: {worker_id}"
         )
 
-        reconciliation_result = await run_worker_reconciliation(
-            db,
-            worker
-        )
+        maintenance.schedule_reconciliation(worker_id)
+
+        reconciliation_result = "scheduled"
 
     return {
         "message": "Heartbeat received",
@@ -454,6 +428,23 @@ async def upload_object(
     file: UploadFile = File(...),
     metadata: str = Form(default="{}"),
     db: Session = Depends(get_db)
+):
+    # Track in-flight uploads: chunks are on the workers before their
+    # metadata is committed, and reconciliation must not mistake them
+    # for unknown chunks.
+    maintenance.upload_started()
+
+    try:
+        return await _upload_object_impl(file, metadata, db)
+
+    finally:
+        maintenance.upload_finished()
+
+
+async def _upload_object_impl(
+    file: UploadFile,
+    metadata: str,
+    db: Session
 ):
 
     # Step 1: Validate custom metadata.
@@ -508,16 +499,25 @@ async def upload_object(
         custom_metadata=custom_metadata
     )
 
-    db.add(object_record)
-
     stored_locations = []
     chunk_results = []
 
     try:
 
-        db.flush()
+        # Current ACTIVE chunk count per worker, so that placement can
+        # keep the cluster balanced.
+        load = {
+            worker_id: count
+            for worker_id, count in db.query(
+                ChunkReplica.worker_id,
+                func.count(ChunkReplica.id)
+            ).filter(
+                ChunkReplica.status == "ACTIVE"
+            ).group_by(ChunkReplica.worker_id).all()
+        }
 
-        # Step 6: Store chunks with replication.
+        # Step 6: Store chunks with replication (no database writes
+        # happen during network I/O, so no write lock is held).
 
         for chunk in chunks:
 
@@ -525,7 +525,8 @@ async def upload_object(
                 db,
                 object_id,
                 chunk,
-                workers
+                workers,
+                load
             )
 
             chunk_results.append(result)
@@ -538,13 +539,46 @@ async def upload_object(
                     (worker_id, chunk["chunk_id"])
                 )
 
+                load[worker_id] = load.get(worker_id, 0) + 1
+
             if not result["replication_complete"]:
 
                 raise RuntimeError(
                     f"Replication failed for chunk {chunk['chunk_id']}"
                 )
 
-        # Step 7: Commit object, chunk and replica metadata.
+        # Step 7: Record object, chunk and replica metadata and commit
+        # in one short transaction.
+
+        db.add(object_record)
+        db.flush()
+
+        for chunk, result in zip(chunks, chunk_results):
+
+            db.add(
+                Chunk(
+                    chunk_id=chunk["chunk_id"],
+                    object_id=object_id,
+                    sequence_number=chunk["sequence_number"],
+                    size=chunk["size"],
+                    checksum=chunk["checksum"]
+                )
+            )
+
+        db.flush()
+
+        for chunk, result in zip(chunks, chunk_results):
+
+            for worker_id in result["replicas"]:
+
+                db.add(
+                    ChunkReplica(
+                        chunk_id=chunk["chunk_id"],
+                        worker_id=worker_id,
+                        status="ACTIVE",
+                        checksum=chunk["checksum"]
+                    )
+                )
 
         db.commit()
 
@@ -887,11 +921,20 @@ async def download_object(
 
                     try:
 
-                        repair_result = await repair_chunk_replication(
-                            db,
-                            chunk,
-                            chunk_content
-                        )
+                        # Serialize with the background maintenance loop so
+                        # that two repairers never create the same replica
+                        # row, and re-read rows it may have just committed.
+                        async with maintenance.RECONCILE_LOCK:
+
+                            db.expire_all()
+
+                            repair_result = await repair_chunk_replication(
+                                db,
+                                chunk,
+                                chunk_content
+                            )
+
+                            db.commit()
 
                         print(
                             f"[Controller] Repair result for "
@@ -899,6 +942,10 @@ async def download_object(
                         )
 
                     except Exception as error:
+
+                        # A failed repair must neither fail the download
+                        # nor leave the session in a broken state.
+                        db.rollback()
 
                         print(
                             f"[Controller] Repair failed for "
@@ -1039,9 +1086,11 @@ async def delete_object(
             ChunkReplica.chunk_id.in_(chunk_ids)
         ).all()
 
-    # Step 4: Delete physical chunk copies.
+    # Step 4: Delete physical chunk copies. A copy that cannot be removed
+    # now (worker down) is queued and removed when the worker is healthy
+    # again, so DELETE succeeds without leaving orphaned data behind.
 
-    failures = []
+    queued_workers = set()
 
     async with httpx.AsyncClient(timeout=10.0) as client:
 
@@ -1052,40 +1101,52 @@ async def delete_object(
             ).first()
 
             if not worker:
-
-                failures.append(replica.worker_id)
                 continue
 
-            try:
+            deleted = False
 
-                response = await client.delete(
-                    f"{worker.base_url}/internal/chunks/{replica.chunk_id}"
-                )
+            if worker.status == "HEALTHY":
 
-                # 404 means the physical copy is already absent.
+                try:
 
-                if response.status_code not in (200, 204, 404):
+                    response = await client.delete(
+                        f"{worker.base_url}/internal/chunks/{replica.chunk_id}"
+                    )
 
-                    failures.append(replica.worker_id)
+                    # 404 means the physical copy is already absent.
 
-            except httpx.HTTPError:
+                    deleted = response.status_code in (200, 204, 404)
 
-                failures.append(replica.worker_id)
+                except httpx.HTTPError:
 
-    # Step 5: Retain metadata if physical cleanup is incomplete.
+                    deleted = False
 
-    if failures:
+            if not deleted:
 
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "message": (
-                    "Could not delete all physical replicas. "
-                    "Retry after workers recover."
-                ),
-                "unavailable_workers": sorted(set(failures))
-            }
+                already_queued = db.query(PendingDelete).filter(
+                    PendingDelete.worker_id == replica.worker_id,
+                    PendingDelete.chunk_id == replica.chunk_id
+                ).first()
+
+                if not already_queued:
+
+                    db.add(
+                        PendingDelete(
+                            worker_id=replica.worker_id,
+                            chunk_id=replica.chunk_id
+                        )
+                    )
+
+                queued_workers.add(replica.worker_id)
+
+    if queued_workers:
+
+        print(
+            f"[Controller] Deferred physical delete on "
+            f"{sorted(queued_workers)} for object {object_id}"
         )
+
+    # Step 5: Remove metadata.
 
     # Step 6: Delete database records in dependency order.
 

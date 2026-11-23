@@ -16,9 +16,13 @@ env/
 *.sqlite
 *.sqlite3
 
-# Runtime worker storage
+# Runtime worker + controller storage
 data/*
 !data/.gitkeep
+controller_data/*
+!controller_data/.gitkeep
+client_files/*
+!client_files/.gitkeep
 
 # Test/generated files
 test_files/
@@ -35,6 +39,3 @@ recovered.pdf
 # OS
 .DS_Store
 Thumbs.db
-
-# Docker controller runtime database
-controller_data/
